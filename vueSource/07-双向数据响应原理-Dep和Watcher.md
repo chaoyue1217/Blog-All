@@ -235,9 +235,171 @@ run () {
   }
 ```
 
-**总结：**
+### 异步队列更新
+异步队列更新调用的是`queueWatcher`，其实最后也是调用的`run`方法来更新的，先看一下其中的过程：
+```js
+export const MAX_UPDATE_COUNT = 100
+
+const queue: Array<Watcher> = []
+const activatedChildren: Array<Component> = []
+let has: { [key: number]: ?true } = {}
+let circular: { [key: number]: number } = {}
+let waiting = false
+let flushing = false
+let index = 0
+export function queueWatcher (watcher: Watcher) {
+  const id = watcher.id
+  // has用来保证每个watcher对象只添加一次
+  if (has[id] == null) {
+    has[id] = true
+    if (!flushing) {// 往队列中添加watcher对象
+      queue.push(watcher)
+    } else {
+      // if already flushing, splice the watcher based on its id
+      // if already past its id, it will be run next immediately.
+      let i = queue.length - 1
+      while (i > index && queue[i].id > watcher.id) {
+        i--
+      }
+      queue.splice(i + 1, 0, watcher)
+    }
+    // 刷新队列，保证只刷新一次
+    if (!waiting) {
+      waiting = true
+      nextTick(flushSchedulerQueue)
+    }
+  }
+}
+```
+引入队列的作用：不会在每次数据改变的时候都触发`watcher`的回调，而是把这些`watcher`先添加到一个队列里，然后在`nextTick`时执行`flushSchedulerQueue`。
+
+下面看一下`flushSchedulerQueue`
+```js
+function flushSchedulerQueue () {
+  // do not cache length because more watchers might be pushed
+  // as we run existing watchers
+  for (index = 0; index < queue.length; index++) {
+    watcher = queue[index]
+    id = watcher.id
+    has[id] = null
+    watcher.run()
+    // in dev build, check and stop circular updates.
+    if (process.env.NODE_ENV !== 'production' && has[id] != null) {
+      circular[id] = (circular[id] || 0) + 1
+      if (circular[id] > MAX_UPDATE_COUNT) {
+        warn(
+          'You may have an infinite update loop ' + (
+            watcher.user
+              ? `in watcher with expression "${watcher.expression}"`
+              : `in a component render function.`
+          ),
+          watcher.vm
+        )
+        break
+      }
+    }
+  }
+
+  // keep copies of post queues before resetting state
+  const activatedQueue = activatedChildren.slice()
+  const updatedQueue = queue.slice()
+
+  resetSchedulerState()
+
+  // call component updated and activated hooks
+  callActivatedHooks(activatedQueue)
+  callUpdatedHooks(updatedQueue)
+
+  // devtool hook
+  /* istanbul ignore if */
+  if (devtools && config.devtools) {
+    devtools.emit('flush')
+  }
+}
+```
+
+- 首先是一个排序操作：
+```js
+  flushing = true
+  let watcher, id
+  queue.sort((a, b) => a.id - b.id)
+```
+对`queue`进行排序，作用有以下几点：
+- 1、组件的更新由父到子：因为父组件的创建过程是先于子组件的，所以`watcher`的创建也是先父后子的，执行顺序也应该保持先父后子
+- 2、用户自定义的`watcher`要优先于渲染`watcher`执行：因为用户自定义的`watcher`是在渲染`watcher`之前创建的
+- 3、如果一个组件在父组件的`watcher`执行期间被销毁，那么它对应的`watcher`执行都可以被跳过，所以父组件的`watcher`应该先执行
+
+- 在队列排序完成之后，对队列进行了遍历，执行`watcher.run()`:
+```js
+for (index = 0; index < queue.length; index++) {
+    watcher = queue[index]
+    id = watcher.id
+    has[id] = null
+    watcher.run()
+    // in dev build, check and stop circular updates.
+    if (process.env.NODE_ENV !== 'production' && has[id] != null) {
+      circular[id] = (circular[id] || 0) + 1
+      if (circular[id] > MAX_UPDATE_COUNT) {
+        warn(
+          'You may have an infinite update loop ' + (
+            watcher.user
+              ? `in watcher with expression "${watcher.expression}"`
+              : `in a component render function.`
+          ),
+          watcher.vm
+        )
+        break
+      }
+    }
+  }
+```
+【注意】每次遍历的时候都要对`queue.length`进行重新计算，因为在执行`run`方法的时候，很可能会添加新的`watcher`，因此会再次执行`queueWatcher`：
+```js
+  const id = watcher.id
+  if (has[id] == null) {
+    has[id] = true
+    if (!flushing) {// 这时，flushing为true，会执行else
+      queue.push(watcher)
+    } else {
+      let i = queue.length - 1
+      while (i > index && queue[i].id > watcher.id) {
+        i--
+      }
+      // 从后往前遍历，找到合适的id位置，把watcher插入到队列中
+      queue.splice(i + 1, 0, watcher)
+    }
+  }
+```
+经过以上操作，队列的长度发生了变化。
+
+- 最后进行状态恢复`resetSchedulerState()`
+```js
+function resetSchedulerState () {
+  index = queue.length = activatedChildren.length = 0
+  has = {}
+  if (process.env.NODE_ENV !== 'production') {
+    circular = {}
+  }
+  waiting = flushing = false
+}
+```
+主要作用就是将一些变量恢复初始值，把`watcher`队列清空。
+
+# 总结
 `Watcher`有两个作用：
 - 监听数据的变化
 - 在数据变化时更新视图
 
 ![avatar](./Watcher.png)
+
+下面梳理一下Observe、Watcher、Dep之间的关系：
+-  初始化Vue实例的过程中，数据`data`会递归的为每个属性生成一个Observer，每个Observe中又会初始化一个Dep实例
+-  模板中的每个指令和数据绑定都会生成一个Watcher，实例化Watcher时，会设置Dep的静态属性target指向自身，并且手动触发getter拦截数据，从而实现依赖的收集
+-  在getter中判断`Dep.target`是否存在，存在则将dep保存到watcher中，并在Dep实例中添加watcher为订阅者
+-  重复以上过程直到watcher计算完成，`Dep.target`清除，依赖收集完成
+
+
+
+
+
+

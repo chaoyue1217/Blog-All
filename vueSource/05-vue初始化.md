@@ -97,7 +97,7 @@ function initRender (vm: Component) {
 }
 ```
 
-`initRender`虽然比较复杂，但是简单来说也是在实例上添加属性的：
+`initRender`虽然比较复杂，但是简单来说有两点：1、在实例上添加属性 2、渲染dom
 ```js
 vm._vnode
 vm._staticTrees

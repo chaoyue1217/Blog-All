@@ -1,6 +1,6 @@
 ---
 title:  简单模拟vue的数据绑定
-date: 2019-04-01
+date: 2018-11-01
 categories: vue-SourceCode
 ---
 
